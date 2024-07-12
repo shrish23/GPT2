@@ -9,6 +9,7 @@ import sys
 import time
 import os
 import numpy as np
+from hellaswag import render_example, iterate_examples
 
 #--------------------------------------------------------------------------------------
 
@@ -298,9 +299,31 @@ class DataloaderLite:
             self.current_position = self.B * self.T * self.process_rank
         return x,y
 
-
-
 # --------------------------------------------------------------------------------------
+
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+# -----------------------------------------------------------------------------
 # Running the training loop
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -371,12 +394,12 @@ if master_process:
 train_loader = DataloaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
 val_loader = DataloaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
 
-torch.set_float32_matmul_precision("high")# high precision for matrix multiplication: this gives better throughput on the GPU
+# torch.set_float32_matmul_precision("high")# high precision for matrix multiplication: this gives better throughput on the GPU
 
 model = GPT(GPTConfig(vocab_size=50304))# increasing the number of fake tokens, so that the number of tokens is power of 2
 model.eval()
 model.to(device)
-model = torch.compile(model)# compile the model to TorchScript for better performance
+#model = torch.compile(model)# compile the model to TorchScript for better performance
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # if DDP is used, then model is a wrapper around the actual model
@@ -404,11 +427,19 @@ def get_lr(it):
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)# AdamW optimizer
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)# This is the optimizer used in the GPT3 paper
 
+# create the log directory we eill write checkpoints to and the logging file
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "log.txt")
+with open(log_file, "w") as f:# open for writeing to clear the file
+    pass
+
+
 for step in range(max_steps):
     t0 = time.time()
-
+    last_step = (step == max_steps - 1)
     # once in a while evaluate our validation loss
-    if step % 100 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -424,10 +455,44 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} {val_loss_accum.item():.4f}\n")
+
+    # once in a while evaluate hellaswag
+    if step %250==0 or last_step:
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i% ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            #get the logits
+            with torch.no_grad():
+                logits,loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total} = {acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
 
 
     # once in a while generate from the model (except step 0, which is noise)
-    if step >0 and step % 100 == 0:
+    if (step >0 and step % 250 == 0) or last_step:
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -439,7 +504,7 @@ for step in range(max_steps):
         xgen = tokens.to(device)
         # generate right now x is (B,T) where B is 5 and T is 8
         sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42+dpp_rank)# set the seed for the random number generator
+        sample_rng.manual_seed(42+ddp_rank)# set the seed for the random number generator
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
@@ -497,6 +562,8 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:4d} | loss: {loss_accum.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train: {loss_accum.item():.6f}\n")
 
 
 if ddp:
